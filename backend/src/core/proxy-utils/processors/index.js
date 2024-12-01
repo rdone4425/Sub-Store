@@ -1,12 +1,25 @@
 import resourceCache from '@/utils/resource-cache';
 import scriptResourceCache from '@/utils/script-resource-cache';
-import { isIPv4, isIPv6 } from '@/utils';
+import { isIPv4, isIPv6, ipAddress } from '@/utils';
 import { FULL } from '@/utils/logical';
-import { getFlag } from '@/utils/geo';
+import { getFlag, removeFlag } from '@/utils/geo';
+import { doh } from '@/utils/dns';
 import lodash from 'lodash';
 import $ from '@/core/app';
 import { hex_md5 } from '@/vendor/md5';
 import { ProxyUtils } from '@/core/proxy-utils';
+import { produceArtifact } from '@/restful/sync';
+import { SETTINGS_KEY } from '@/constants';
+
+import env from '@/utils/env';
+import {
+    getFlowField,
+    getFlowHeaders,
+    parseFlowHeaders,
+    validCheck,
+    flowTransfer,
+    getRmainingDays,
+} from '@/utils/flow';
 
 /**
  The rule "(name CONTAINS "🇨🇳") AND (port IN [80, 443])" can be expressed as follows:
@@ -77,12 +90,15 @@ function QuickSettingOperator(args) {
             if (get(args.useless)) {
                 const filter = UselessFilter();
                 const selected = filter.func(proxies);
-                proxies.filter((_, i) => selected[i]);
+                proxies = proxies.filter(
+                    (p, i) => selected[i] && p.port > 0 && p.port <= 65535,
+                );
             }
 
             return proxies.map((proxy) => {
                 proxy.udp = get(args.udp, proxy.udp);
                 proxy.tfo = get(args.tfo, proxy.tfo);
+                proxy['fast-open'] = get(args.tfo, proxy['fast-open']);
                 proxy['skip-cert-verify'] = get(
                     args.scert,
                     proxy['skip-cert-verify'],
@@ -108,7 +124,7 @@ function QuickSettingOperator(args) {
 }
 
 // add or remove flag for proxies
-function FlagOperator({ mode }) {
+function FlagOperator({ mode, tw }) {
     return {
         name: 'Flag Operator',
         func: (proxies) => {
@@ -122,7 +138,13 @@ function FlagOperator({ mode }) {
                     // remove old flag
                     proxy.name = removeFlag(proxy.name);
                     proxy.name = newFlag + ' ' + proxy.name;
-                    proxy.name = proxy.name.replace(/🇹🇼/g, '🇨🇳');
+                    if (tw == 'ws') {
+                        proxy.name = proxy.name.replace(/🇹🇼/g, '🇼🇸');
+                    } else if (tw == 'tw') {
+                        // 不变
+                    } else {
+                        proxy.name = proxy.name.replace(/🇹🇼/g, '🇨🇳');
+                    }
                 }
                 return proxy;
             });
@@ -294,7 +316,7 @@ function RegexDeleteOperator(regex) {
  1. This function name should be `operator`!
  2. Always declare variables before using them!
  */
-function ScriptOperator(script, targetPlatform, $arguments) {
+function ScriptOperator(script, targetPlatform, $arguments, source, $options) {
     return {
         name: 'Script Operator',
         func: async (proxies) => {
@@ -304,135 +326,268 @@ function ScriptOperator(script, targetPlatform, $arguments) {
                     'operator',
                     script,
                     $arguments,
+                    $options,
                 );
-                output = operator(proxies, targetPlatform);
+                output = operator(proxies, targetPlatform, { source, ...env });
+            })();
+            return output;
+        },
+        nodeFunc: async (proxies) => {
+            let output = proxies;
+            await (async function () {
+                const operator = createDynamicFunction(
+                    'operator',
+                    `async function operator(input = []) {
+                        if (input && (input.$files || input.$content)) {
+                            let { $content, $files, $options } = input
+                            ${script}
+                            return { $content, $files, $options }
+                        } else {
+                            let proxies = input
+                            let list = []
+                            for await (let $server of proxies) {
+                                ${script}
+                                list.push($server)
+                            }
+                            return list
+                        }
+                      }`,
+                    $arguments,
+                    $options,
+                );
+                output = operator(proxies, targetPlatform, { source, ...env });
             })();
             return output;
         },
     };
 }
 
-const DOMAIN_RESOLVERS = {
-    Google: async function (domain) {
-        const id = hex_md5(`GOOGLE:${domain}`);
-        const cached = resourceCache.get(id);
-        if (cached) return cached;
-        const resp = await $.http.get({
-            url: `https://8.8.4.4/resolve?name=${encodeURIComponent(
-                domain,
-            )}&type=A`,
-            headers: {
-                accept: 'application/dns-json',
-            },
-        });
-        const body = JSON.parse(resp.body);
-        if (body['Status'] !== 0) {
-            throw new Error(`Status is ${body['Status']}`);
+function parseIP4P(IP4P) {
+    let server;
+    let port;
+    try {
+        let array = IP4P.split(':');
+
+        port = parseInt(array[2], 16);
+        let ipab = parseInt(array[3], 16);
+        let ipcd = parseInt(array[4], 16);
+        let ipa = ipab >> 8;
+        let ipb = ipab & 0xff;
+        let ipc = ipcd >> 8;
+        let ipd = ipcd & 0xff;
+        server = `${ipa}.${ipb}.${ipc}.${ipd}`;
+        if (port <= 0 || port > 65535) {
+            throw new Error(`Invalid port number: ${port}`);
         }
-        const answers = body['Answer'];
-        if (answers.length === 0) {
+        if (!isIPv4(server)) {
+            throw new Error(`Invalid IP address: ${server}`);
+        }
+    } catch (e) {
+        // throw new Error(`IP4P 解析失败: ${e}`);
+        $.error(`IP4P 解析失败: ${e}`);
+    }
+    return { server, port };
+}
+
+const DOMAIN_RESOLVERS = {
+    Custom: async function (domain, type, noCache, timeout, edns, url) {
+        const id = hex_md5(`CUSTOM:${url}:${domain}:${type}`);
+        const cached = resourceCache.get(id);
+        if (!noCache && cached) return cached;
+        const answerType = type === 'IPv6' ? 'AAAA' : 'A';
+        const res = await doh({
+            url,
+            domain,
+            type: answerType,
+            timeout,
+            edns,
+        });
+
+        const { answers } = res;
+        if (!Array.isArray(answers) || answers.length === 0) {
             throw new Error('No answers');
         }
-        const result = answers[answers.length - 1].data;
+        const result = answers
+            .filter((i) => i?.type === answerType)
+            .map((i) => i?.data)
+            .filter((i) => i);
+        if (result.length === 0) {
+            throw new Error('No answers');
+        }
         resourceCache.set(id, result);
         return result;
     },
-    'IP-API': async function (domain) {
+    Google: async function (domain, type, noCache, timeout, edns) {
+        const id = hex_md5(`GOOGLE:${domain}:${type}`);
+        const cached = resourceCache.get(id);
+        if (!noCache && cached) return cached;
+        const answerType = type === 'IPv6' ? 'AAAA' : 'A';
+        const res = await doh({
+            url: 'https://8.8.4.4/dns-query',
+            domain,
+            type: answerType,
+            timeout,
+            edns,
+        });
+
+        const { answers } = res;
+        if (!Array.isArray(answers) || answers.length === 0) {
+            throw new Error('No answers');
+        }
+        const result = answers
+            .filter((i) => i?.type === answerType)
+            .map((i) => i?.data)
+            .filter((i) => i);
+        if (result.length === 0) {
+            throw new Error('No answers');
+        }
+        resourceCache.set(id, result);
+        return result;
+    },
+    'IP-API': async function (domain, type, noCache, timeout) {
+        if (['IPv6'].includes(type)) {
+            throw new Error(`域名解析服务提供方 IP-API 不支持 ${type}`);
+        }
         const id = hex_md5(`IP-API:${domain}`);
         const cached = resourceCache.get(id);
-        if (cached) return cached;
+        if (!noCache && cached) return cached;
         const resp = await $.http.get({
             url: `http://ip-api.com/json/${encodeURIComponent(
                 domain,
             )}?lang=zh-CN`,
+            timeout,
         });
         const body = JSON.parse(resp.body);
         if (body['status'] !== 'success') {
             throw new Error(`Status is ${body['status']}`);
         }
-        const result = body.query;
-        resourceCache.set(id, result);
-        return result;
-    },
-    Cloudflare: async function (domain) {
-        const id = hex_md5(`CLOUDFLARE:${domain}`);
-        const cached = resourceCache.get(id);
-        if (cached) return cached;
-        const resp = await $.http.get({
-            url: `https://1.0.0.1/dns-query?name=${encodeURIComponent(
-                domain,
-            )}&type=A`,
-            headers: {
-                accept: 'application/dns-json',
-            },
-        });
-        const body = JSON.parse(resp.body);
-        if (body['Status'] !== 0) {
-            throw new Error(`Status is ${body['Status']}`);
-        }
-        const answers = body['Answer'];
-        if (answers.length === 0) {
+        if (!body.query || body.query === 0) {
             throw new Error('No answers');
         }
-        const result = answers[answers.length - 1].data;
+        const result = [body.query];
+        if (result.length === 0) {
+            throw new Error('No answers');
+        }
         resourceCache.set(id, result);
         return result;
     },
-    Ali: async function (domain) {
-        const id = hex_md5(`ALI:${domain}`);
+    Cloudflare: async function (domain, type, noCache, timeout, edns) {
+        const id = hex_md5(`CLOUDFLARE:${domain}:${type}`);
         const cached = resourceCache.get(id);
-        if (cached) return cached;
+        if (!noCache && cached) return cached;
+        const answerType = type === 'IPv6' ? 'AAAA' : 'A';
+        const res = await doh({
+            url: 'https://1.0.0.1/dns-query',
+            domain,
+            type: answerType,
+            timeout,
+            edns,
+        });
+
+        const { answers } = res;
+        if (!Array.isArray(answers) || answers.length === 0) {
+            throw new Error('No answers');
+        }
+        const result = answers
+            .filter((i) => i?.type === answerType)
+            .map((i) => i?.data)
+            .filter((i) => i);
+        if (result.length === 0) {
+            throw new Error('No answers');
+        }
+        resourceCache.set(id, result);
+        return result;
+    },
+    Ali: async function (domain, type, noCache, timeout, edns) {
+        const id = hex_md5(`ALI:${domain}:${type}`);
+        const cached = resourceCache.get(id);
+        if (!noCache && cached) return cached;
         const resp = await $.http.get({
-            url: `http://223.6.6.6/resolve?name=${encodeURIComponent(
+            url: `http://223.6.6.6/resolve?edns_client_subnet=${edns}/24&name=${encodeURIComponent(
                 domain,
-            )}&type=A&short=1`,
+            )}&type=${type === 'IPv6' ? 'AAAA' : 'A'}&short=1`,
             headers: {
                 accept: 'application/dns-json',
             },
+            timeout,
         });
         const answers = JSON.parse(resp.body);
-        if (answers.length === 0) {
+        if (!Array.isArray(answers) || answers.length === 0) {
             throw new Error('No answers');
         }
-        const result = answers[answers.length - 1];
+        const result = answers;
+        if (result.length === 0) {
+            throw new Error('No answers');
+        }
         resourceCache.set(id, result);
         return result;
     },
-    Tencent: async function (domain) {
-        const id = hex_md5(`ALI:${domain}`);
+    Tencent: async function (domain, type, noCache, timeout, edns) {
+        const id = hex_md5(`TENCENT:${domain}:${type}`);
         const cached = resourceCache.get(id);
-        if (cached) return cached;
+        if (!noCache && cached) return cached;
         const resp = await $.http.get({
-            url: `http://119.28.28.28/d?type=A&dn=${encodeURIComponent(
-                domain,
-            )}`,
+            url: `http://119.28.28.28/d?ip=${edns}&type=${
+                type === 'IPv6' ? 'AAAA' : 'A'
+            }&dn=${encodeURIComponent(domain)}`,
             headers: {
                 accept: 'application/dns-json',
             },
+            timeout,
         });
         const answers = resp.body.split(';').map((i) => i.split(',')[0]);
-        if (answers.length === 0) {
+        if (answers.length === 0 || String(answers) === '0') {
             throw new Error('No answers');
         }
-        const result = answers[answers.length - 1];
+        const result = answers;
+        if (result.length === 0) {
+            throw new Error('No answers');
+        }
         resourceCache.set(id, result);
         return result;
     },
 };
 
-function ResolveDomainOperator({ provider }) {
+function ResolveDomainOperator({
+    provider,
+    type: _type,
+    filter,
+    cache,
+    url,
+    timeout,
+    edns: _edns,
+}) {
+    if (['IPv6', 'IP4P'].includes(_type) && ['IP-API'].includes(provider)) {
+        throw new Error(`域名解析服务提供方 ${provider} 不支持 ${_type}`);
+    }
+    const { defaultTimeout } = $.read(SETTINGS_KEY);
+    const requestTimeout = timeout || defaultTimeout || 8000;
+    let type = ['IPv6', 'IP4P'].includes(_type) ? 'IPv6' : 'IPv4';
+
     const resolver = DOMAIN_RESOLVERS[provider];
     if (!resolver) {
-        throw new Error(`Cannot find resolver: ${provider}`);
+        throw new Error(`找不到域名解析服务提供方: ${provider}`);
     }
+    let edns = _edns || '223.6.6.6';
+    if (!isIP(edns)) throw new Error(`域名解析 EDNS 应为 IP`);
+    $.info(
+        `Domain Resolver: [${_type}] ${provider} ${edns || ''} ${url || ''}`,
+    );
     return {
         name: 'Resolve Domain Operator',
         func: async (proxies) => {
+            proxies.forEach((p, i) => {
+                if (!p['_no-resolve'] && p['no-resolve']) {
+                    proxies[i]['_no-resolve'] = p['no-resolve'];
+                }
+            });
             const results = {};
             const limit = 15; // more than 20 concurrency may result in surge TCP connection shortage.
             const totalDomain = [
                 ...new Set(
-                    proxies.filter((p) => !isIP(p.server)).map((c) => c.server),
+                    proxies
+                        .filter((p) => !isIP(p.server) && !p['_no-resolve'])
+                        .map((c) => c.server),
                 ),
             ];
             const totalBatch = Math.ceil(totalDomain.length / limit);
@@ -440,7 +595,14 @@ function ResolveDomainOperator({ provider }) {
                 const currentBatch = [];
                 for (let domain of totalDomain.splice(0, limit)) {
                     currentBatch.push(
-                        resolver(domain)
+                        resolver(
+                            domain,
+                            type,
+                            cache === 'disabled',
+                            requestTimeout,
+                            edns,
+                            url,
+                        )
                             .then((ip) => {
                                 results[domain] = ip;
                                 $.info(
@@ -456,11 +618,77 @@ function ResolveDomainOperator({ provider }) {
                 }
                 await Promise.all(currentBatch);
             }
-            proxies.forEach((proxy) => {
-                proxy.server = results[proxy.server] || proxy.server;
+            proxies.forEach((p) => {
+                if (!p['_no-resolve']) {
+                    if (results[p.server]) {
+                        p._resolved_ips = results[p.server];
+                        let ip = Array.isArray(results[p.server])
+                            ? results[p.server][
+                                  Math.floor(
+                                      Math.random() * results[p.server].length,
+                                  )
+                              ]
+                            : results[p.server];
+                        if (type === 'IPv6' && isIPv6(ip)) {
+                            try {
+                                ip = new ipAddress.Address6(ip).correctForm();
+                            } catch (e) {
+                                $.error(
+                                    `Failed to parse IPv6 address: ${ip}: ${e}`,
+                                );
+                            }
+                            if (/^2001::[^:]+:[^:]+:[^:]+$/.test(ip)) {
+                                p._IP4P = ip;
+                                const { server, port } = parseIP4P(ip);
+                                if (server && port) {
+                                    p._domain = p.server;
+                                    p.server = server;
+                                    p.port = port;
+                                    p.resolved = true;
+                                    p._IPv4 = p.server;
+                                    if (!isIP(p._IP)) {
+                                        p._IP = p.server;
+                                    }
+                                } else if (!p.resolved) {
+                                    p.resolved = false;
+                                }
+                            } else {
+                                p._domain = p.server;
+                                p.server = ip;
+                                p.resolved = true;
+                                p[`_${type}`] = p.server;
+                                if (!isIP(p._IP)) {
+                                    p._IP = p.server;
+                                }
+                            }
+                        } else {
+                            p._domain = p.server;
+                            p.server = ip;
+                            p.resolved = true;
+                            p[`_${type}`] = p.server;
+                            if (!isIP(p._IP)) {
+                                p._IP = p.server;
+                            }
+                        }
+                    } else if (!p.resolved) {
+                        p.resolved = false;
+                    }
+                }
             });
 
-            return proxies;
+            return proxies.filter((p) => {
+                if (filter === 'removeFailed') {
+                    return isIP(p.server) || p['_no-resolve'] || p.resolved;
+                } else if (filter === 'IPOnly') {
+                    return isIP(p.server);
+                } else if (filter === 'IPv4Only') {
+                    return isIPv4(p.server);
+                } else if (filter === 'IPv6Only') {
+                    return isIPv6(p.server);
+                } else {
+                    return true;
+                }
+            });
         },
     };
 }
@@ -501,6 +729,8 @@ function RegionFilter(regions) {
         SG: '🇸🇬',
         JP: '🇯🇵',
         UK: '🇬🇧',
+        DE: '🇩🇪',
+        KR: '🇰🇷',
     };
     return {
         name: 'Region Filter',
@@ -562,7 +792,7 @@ function TypeFilter(types) {
  1. This function name should be `filter`!
  2. Always declare variables before using them!
  */
-function ScriptFilter(script, targetPlatform, $arguments) {
+function ScriptFilter(script, targetPlatform, $arguments, source, $options) {
     return {
         name: 'Script Filter',
         func: async (proxies) => {
@@ -572,8 +802,32 @@ function ScriptFilter(script, targetPlatform, $arguments) {
                     'filter',
                     script,
                     $arguments,
+                    $options,
                 );
-                output = filter(proxies, targetPlatform);
+                output = filter(proxies, targetPlatform, { source, ...env });
+            })();
+            return output;
+        },
+        nodeFunc: async (proxies) => {
+            let output = FULL(proxies.length, true);
+            await (async function () {
+                const filter = createDynamicFunction(
+                    'filter',
+                    `async function filter(input = []) {
+                        let proxies = input
+                        let list = []
+                        const fn = async ($server) => {
+                            ${script}
+                        }
+                        for await (let $server of proxies) {
+                            list.push(await fn($server))
+                        }
+                        return list
+                      }`,
+                    $arguments,
+                    $options,
+                );
+                output = filter(proxies, targetPlatform, { source, ...env });
             })();
             return output;
         },
@@ -605,9 +859,32 @@ async function ApplyFilter(filter, objs) {
     try {
         selected = await filter.func(objs);
     } catch (err) {
-        // print log and skip this filter
-        $.error(`Cannot apply filter ${filter.name}\n Reason: ${err}`);
-        throw new Error(`脚本过滤失败 ${err.message ?? err}`);
+        let funcErr = '';
+        let funcErrMsg = `${err.message ?? err}`;
+        if (funcErrMsg.includes('$server is not defined')) {
+            funcErr = '';
+        } else {
+            $.error(
+                `Cannot apply filter ${filter.name}(function filter)! Reason: ${err}`,
+            );
+            funcErr = `执行 function filter 失败 ${funcErrMsg}; `;
+        }
+        try {
+            selected = await filter.nodeFunc(objs);
+        } catch (err) {
+            $.error(
+                `Cannot apply filter ${filter.name}(shortcut script)! Reason: ${err}`,
+            );
+            let nodeErr = '';
+            let nodeErrMsg = `${err.message ?? err}`;
+            if (funcErr && nodeErrMsg === funcErrMsg) {
+                nodeErr = '';
+                funcErr = `执行失败 ${funcErrMsg}`;
+            } else {
+                nodeErr = `执行快捷过滤脚本 失败 ${nodeErrMsg}`;
+            }
+            throw new Error(`脚本过滤 ${funcErr}${nodeErr}`);
+        }
     }
     return objs.filter((_, i) => selected[i]);
 }
@@ -618,9 +895,39 @@ async function ApplyOperator(operator, objs) {
         const output_ = await operator.func(output);
         if (output_) output = output_;
     } catch (err) {
-        // print log and skip this operator
-        $.error(`Cannot apply operator ${operator.name}! Reason: ${err}`);
-        throw new Error(`脚本操作失败 ${err.message ?? err}`);
+        let funcErr = '';
+        let funcErrMsg = `${err.message ?? err}`;
+        if (
+            funcErrMsg.includes('$server is not defined') ||
+            funcErrMsg.includes('$content is not defined') ||
+            funcErrMsg.includes('$files is not defined') ||
+            output?.$files ||
+            output?.$content
+        ) {
+            funcErr = '';
+        } else {
+            $.error(
+                `Cannot apply operator ${operator.name}(function operator)! Reason: ${err}`,
+            );
+            funcErr = `执行 function operator 失败 ${funcErrMsg}; `;
+        }
+        try {
+            const output_ = await operator.nodeFunc(output);
+            if (output_) output = output_;
+        } catch (err) {
+            $.error(
+                `Cannot apply operator ${operator.name}(shortcut script)! Reason: ${err}`,
+            );
+            let nodeErr = '';
+            let nodeErrMsg = `${err.message ?? err}`;
+            if (funcErr && nodeErrMsg === funcErrMsg) {
+                nodeErr = '';
+                funcErr = `执行失败 ${funcErrMsg}`;
+            } else {
+                nodeErr = `执行快捷脚本 失败 ${nodeErrMsg}`;
+            }
+            throw new Error(`脚本操作 ${funcErr}${nodeErr}`);
+        }
     }
     return output;
 }
@@ -659,17 +966,19 @@ function clone(object) {
     return JSON.parse(JSON.stringify(object));
 }
 
-// remove flag
-function removeFlag(str) {
-    return str
-        .replace(/[\uD83C][\uDDE6-\uDDFF][\uD83C][\uDDE6-\uDDFF]/g, '')
-        .trim();
-}
-
-function createDynamicFunction(name, script, $arguments) {
+function createDynamicFunction(name, script, $arguments, $options) {
+    const flowUtils = {
+        getFlowField,
+        getFlowHeaders,
+        parseFlowHeaders,
+        flowTransfer,
+        validCheck,
+        getRmainingDays,
+    };
     if ($.env.isLoon) {
         return new Function(
             '$arguments',
+            '$options',
             '$substore',
             'lodash',
             '$persistentStore',
@@ -677,9 +986,13 @@ function createDynamicFunction(name, script, $arguments) {
             '$notification',
             'ProxyUtils',
             'scriptResourceCache',
+            'flowUtils',
+            'produceArtifact',
+            'require',
             `${script}\n return ${name}`,
         )(
             $arguments,
+            $options,
             $,
             lodash,
             // eslint-disable-next-line no-undef
@@ -690,15 +1003,32 @@ function createDynamicFunction(name, script, $arguments) {
             $notification,
             ProxyUtils,
             scriptResourceCache,
+            flowUtils,
+            produceArtifact,
+            eval(`typeof require !== "undefined"`) ? require : undefined,
         );
     } else {
         return new Function(
             '$arguments',
+            '$options',
             '$substore',
             'lodash',
             'ProxyUtils',
             'scriptResourceCache',
+            'flowUtils',
+            'produceArtifact',
+            'require',
             `${script}\n return ${name}`,
-        )($arguments, $, lodash, ProxyUtils, scriptResourceCache);
+        )(
+            $arguments,
+            $options,
+            $,
+            lodash,
+            ProxyUtils,
+            scriptResourceCache,
+            flowUtils,
+            produceArtifact,
+            eval(`typeof require !== "undefined"`) ? require : undefined,
+        );
     }
 }
